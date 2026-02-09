@@ -14,8 +14,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 csv_path = ROOT / "data" / "raw" / "kuairec" / "data" / "big_matrix.csv"
 
+
 def sample_negatives(batch_size, num_items, k=10, device="cpu"):
     return torch.randint(0, num_items, (batch_size, k), device=device)
+
 
 def main():
     dataset = KuaiRecOfflineDataset(
@@ -25,10 +27,10 @@ def main():
 
     loader = DataLoader(
         dataset,
-        batch_size=128,                  # bigger batch for speed
+        batch_size=128,
         shuffle=True,
-        num_workers=8,                   # use all CPU cores available
-        pin_memory=True,
+        num_workers=8,
+        pin_memory=torch.cuda.is_available(),
         drop_last=True,
     )
 
@@ -46,8 +48,11 @@ def main():
 
     gamma = 0.99
     tau = 0.7
-    beta = 3.0
+    beta = 0.5
     K = 10
+
+    last_adv_mean = 0.0
+    last_adv_std = 0.0
 
     for step, batch in enumerate(loader):
         state = batch["state"].to(device, non_blocking=True)
@@ -60,6 +65,7 @@ def main():
         q_sa = q_net(state, action)
         with torch.no_grad():
             q_target = reward + gamma * v_net(next_state) * (1 - done)
+
         q_loss = F.mse_loss(q_sa, q_target)
         q_opt.zero_grad()
         q_loss.backward()
@@ -72,25 +78,59 @@ def main():
         v_loss.backward()
         v_opt.step()
 
-        # ----- Policy update -----
-        with torch.no_grad():
-            adv = q_sa.detach() - v
-            weights = torch.exp(beta * adv).clamp(max=20.0)
+        # ----- Policy update (delayed) -----
+        if step % 2 == 0:
+            with torch.no_grad():
+                adv = q_sa.detach() - v
+                adv = (adv - adv.mean()) / (adv.std() + 1e-6)
+                weights = torch.exp(beta * adv).clamp(max=20.0)
 
-        neg_actions = sample_negatives(state.size(0), num_items, K, device=device)
-        all_actions = torch.cat([action.unsqueeze(1), neg_actions], dim=1)
-        scores = pi_net(state, all_actions)
-        labels = torch.zeros(state.size(0), dtype=torch.long, device=device)
-        pi_loss = (weights * F.cross_entropy(scores, labels, reduction="none")).mean()
-        pi_opt.zero_grad()
-        pi_loss.backward()
-        pi_opt.step()
+                last_adv_mean = adv.mean().item()
+                last_adv_std = adv.std().item()
 
+            neg_actions = sample_negatives(state.size(0), num_items, K, device=device)
+            all_actions = torch.cat([action.unsqueeze(1), neg_actions], dim=1)
+            scores = pi_net(state, all_actions)
+
+            labels = torch.zeros(state.size(0), dtype=torch.long, device=device)
+            pi_loss = (weights * F.cross_entropy(scores, labels, reduction="none")).mean()
+
+            pi_opt.zero_grad()
+            pi_loss.backward()
+            torch.nn.utils.clip_grad_norm_(pi_net.parameters(), 5.0)
+            pi_opt.step()
+        else:
+            pi_loss = torch.tensor(0.0)
+
+        # ----- Logging -----
         if step % 50 == 0:
-            print(f"Step {step} | Q {q_loss.item():.3f} | V {v_loss.item():.3f} | Pi {pi_loss.item():.3f}")
+            print(
+                f"Step {step} | "
+                f"Q {q_loss.item():.3f} | "
+                f"V {v_loss.item():.3f} | "
+                f"Pi {pi_loss.item():.3f} | "
+                f"adv mean {last_adv_mean:.3f} | "
+                f"adv std {last_adv_std:.3f}"
+            )
 
-        if step == 500:  # safety stop
+        if step == 500:
             break
+
+    # ----- Save FINAL checkpoint -----
+    ckpt_dir = ROOT / "checkpoints"
+    ckpt_dir.mkdir(exist_ok=True)
+
+    torch.save(
+        {
+            "q": q_net.state_dict(),
+            "v": v_net.state_dict(),
+            "pi": pi_net.state_dict(),
+        },
+        ckpt_dir / "iql_kuairec.pt",
+    )
+
+    print("✅ Saved FINAL IQL checkpoint")
+
 
 if __name__ == "__main__":
     main()
