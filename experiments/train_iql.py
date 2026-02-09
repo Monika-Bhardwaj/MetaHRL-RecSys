@@ -12,18 +12,20 @@ from offline_rl.iql import QNetwork, ValueNetwork, PolicyNetwork, expectile_loss
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+csv_path = ROOT / "data" / "raw" / "kuairec" / "data" / "big_matrix.csv"
+
 def sample_negatives(batch_size, num_items, k=10, device="cpu"):
     return torch.randint(0, num_items, (batch_size, k), device=device)
 
 def main():
     dataset = KuaiRecOfflineDataset(
-        csv_path="data/raw/kuairec/data/big_matrix.csv",
-        history_len=5,
+        csv_path=str(csv_path),
+        history_len=20,
     )
 
     loader = DataLoader(
         dataset,
-        batch_size=512,                  # bigger batch for speed
+        batch_size=128,                  # bigger batch for speed
         shuffle=True,
         num_workers=8,                   # use all CPU cores available
         pin_memory=True,

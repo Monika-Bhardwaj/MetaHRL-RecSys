@@ -9,7 +9,7 @@ class StateEncoder(nn.Module):
     """
     Encode sequence of item IDs via embedding + GRU
     """
-    def __init__(self, num_items, embed_dim, gru_hidden_dim=None, num_layers=1, proj_dim=None):
+    def __init__(self, num_items, embed_dim=64, gru_hidden_dim=128, num_layers=1, proj_dim=None):
         super().__init__()
         self.item_emb = nn.Embedding(num_items, embed_dim)
         if gru_hidden_dim is None:

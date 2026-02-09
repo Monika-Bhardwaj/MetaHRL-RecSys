@@ -8,7 +8,7 @@ class KuaiRecOfflineDataset(Dataset):
     Precomputes embeddings for faster training.
     """
 
-    def __init__(self, csv_path, history_len=5, reward_col="watch_ratio", max_rows=None):
+    def __init__(self, csv_path, history_len=20, reward_col="watch_ratio", max_rows=None):
         self.history_len = history_len
         self.reward_col = reward_col
 
