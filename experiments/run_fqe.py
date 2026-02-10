@@ -74,6 +74,20 @@ def main():
     print("\n==============================")
     print(f"Estimated J(pi) = {total_q / count:.4f}")
     print("==============================\n")
+    
+    from evaluation.behavior_eval import evaluate_behavior_policy
+
+    # --- Behavior baseline ---
+    behavior_j = evaluate_behavior_policy(
+        csv_path=str(csv_path),
+        history_len=20,
+        num_items=num_items,
+        device=device,
+    )
+
+    print(f"Behavior policy J = {behavior_j:.4f}")
+    print(f"IQL policy J = {total_q / count:.4f}")
+    print(f"Lift = {(total_q / count - behavior_j) / abs(behavior_j) * 100:.2f}%")
 
 
 if __name__ == "__main__":
