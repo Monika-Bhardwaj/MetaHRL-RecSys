@@ -14,14 +14,11 @@ def evaluate_behavior_policy(
     device="cpu",
 ):
     """
-    FQE evaluation of the behavior (logging) policy
+    FQE evaluation of the logging (behavior) policy
+    Uses logged actions as π(s')
     """
 
-    dataset = KuaiRecOfflineDataset(
-        csv_path=csv_path,
-        history_len=history_len,
-    )
-
+    dataset = KuaiRecOfflineDataset(csv_path=csv_path, history_len=history_len)
     loader = DataLoader(
         dataset,
         batch_size=256,
@@ -30,11 +27,11 @@ def evaluate_behavior_policy(
         drop_last=True,
     )
 
-    # FQE network
     fqe_net = FQENetwork(num_items, embed_dim, gru_hidden_dim).to(device)
     optimizer = torch.optim.Adam(fqe_net.parameters(), lr=3e-4)
 
-    # ---- Train FQE ----
+    fqe_net.train()
+
     for step, batch in enumerate(loader):
         state = batch["state"].to(device)
         action = batch["action"].to(device)
@@ -43,9 +40,10 @@ def evaluate_behavior_policy(
         done = batch["done"].to(device)
 
         with torch.no_grad():
-            # behavior policy uses logged action
-            next_action = batch["action"].to(device)
-            target_q = reward + 0.99 * fqe_net(next_state, next_action) * (1 - done)
+            # Behavior policy = logged action
+            target_q = reward + 0.99 * fqe_net(
+                next_state, action
+            ) * (1 - done)
 
         q_pred = fqe_net(state, action)
         loss = torch.nn.functional.mse_loss(q_pred, target_q)
@@ -57,11 +55,13 @@ def evaluate_behavior_policy(
         if step % 50 == 0:
             print(f"[Behavior FQE] Step {step} | Loss {loss.item():.4f}")
 
-        if step == 500:
+        if step >= 500:
             break
 
-    # ---- Estimate J(pi_behavior) ----
+    # Estimate J(pi_behavior)
+    fqe_net.eval()
     total_q, count = 0.0, 0
+
     with torch.no_grad():
         for batch in loader:
             state = batch["state"].to(device)

@@ -1,85 +1,99 @@
+# offline_rl/fqe.py
+
+import copy
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-from offline_rl.iql import StateEncoder, ActionEncoder
+import torch.optim as optim
 
 
 class FQENetwork(nn.Module):
-    """
-    Q(s,a) evaluator for a fixed policy π
-    Architecture mirrors QNetwork but trained separately
-    """
-
-    def __init__(self, num_items, embed_dim, gru_hidden_dim):
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
         super().__init__()
-        self.state_enc = StateEncoder(
-            num_items=num_items,
-            embed_dim=embed_dim,
-            gru_hidden_dim=gru_hidden_dim,
-            proj_dim=embed_dim,
-        )
-        self.action_enc = ActionEncoder(num_items, embed_dim)
-
-        self.fc = nn.Sequential(
-            nn.Linear(embed_dim * 2, 256),
+        self.net = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(256, 1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
         )
 
     def forward(self, state, action):
-        s = self.state_enc(state)     # [B, D]
-        a = self.action_enc(action)   # [B, D]
-        return self.fc(torch.cat([s, a], dim=1)).squeeze(-1)
+        x = torch.cat([state, action], dim=-1)
+        return self.net(x)
 
 
-def train_fqe(
-    fqe_net,
-    policy_net,
-    dataloader,
-    optimizer,
-    gamma=0.99,
-    device="cpu",
-    steps=500,
-):
-    """
-    Train FQE with Bellman evaluation updates
-    """
+class FQETrainer:
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        gamma=0.99,
+        lr=3e-4,
+        target_update_freq=50,
+        clip_target=True,
+        device="cpu",
+    ):
+        self.device = device
+        self.gamma = gamma
+        self.clip_target = clip_target
+        self.target_update_freq = target_update_freq
 
-    fqe_net.train()
-    policy_net.eval()
+        self.q_net = FQENetwork(state_dim, action_dim).to(device)
+        self.target_q_net = copy.deepcopy(self.q_net).to(device)
+        self.target_q_net.eval()
 
-    for step, batch in enumerate(dataloader):
-        state = batch["state"].to(device)
-        action = batch["action"].to(device)
-        reward = batch["reward"].to(device)
-        next_state = batch["next_state"].to(device)
-        done = batch["done"].to(device)
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr)
+        self.loss_fn = nn.MSELoss()
 
-        # ----- Bellman target -----
+    def train_step(self, batch, step):
+
+        states, actions, rewards, next_states, next_actions, dones = batch
+
+        states = states.to(self.device)
+        actions = actions.to(self.device)
+        rewards = rewards.to(self.device)
+        next_states = next_states.to(self.device)
+        next_actions = next_actions.to(self.device)
+        dones = dones.to(self.device)
+
         with torch.no_grad():
-            # π(s') → greedy action from policy network
-            # sample top action by dot product
-            num_items = policy_net.action_enc.item_emb.num_embeddings
-            candidates = torch.randint(
-                0, num_items, (state.size(0), 20), device=device
-            )
-            scores = policy_net(next_state, candidates)
-            next_action = candidates.gather(
-                1, scores.argmax(dim=1, keepdim=True)
-            ).squeeze(1)
+            target_q = self.target_q_net(next_states, next_actions)
+            td_target = rewards + self.gamma * (1 - dones) * target_q
 
-            target_q = reward + gamma * fqe_net(next_state, next_action) * (1 - done)
+            if self.clip_target:
+                td_target = torch.clamp(td_target, -10.0, 10.0)
 
-        q_pred = fqe_net(state, action)
-        loss = F.mse_loss(q_pred, target_q)
+        current_q = self.q_net(states, actions)
 
-        optimizer.zero_grad()
+        loss = self.loss_fn(current_q, td_target)
+
+        self.optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
+        self.optimizer.step()
 
-        if step % 50 == 0:
-            print(f"[FQE] Step {step} | Loss {loss.item():.4f}")
+        # Deterministic hard target update
+        if step % self.target_update_freq == 0:
+            self.target_q_net.load_state_dict(self.q_net.state_dict())
 
-        if step == steps:
-            break
+        return loss.item()
+
+    def evaluate_policy(self, dataloader):
+        """
+        Deterministic evaluation.
+        """
+        self.q_net.eval()
+
+        total_q = 0.0
+        total_count = 0
+
+        with torch.no_grad():
+            for batch in dataloader:
+                states, actions, _, _, _, _ = batch
+                states = states.to(self.device)
+                actions = actions.to(self.device)
+
+                q_vals = self.q_net(states, actions)
+                total_q += q_vals.sum().item()
+                total_count += q_vals.shape[0]
+
+        return total_q / total_count
