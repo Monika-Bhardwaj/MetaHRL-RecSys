@@ -1,122 +1,125 @@
 # experiments/run_fqe_multi_seed.py
 
+import os
 import sys
 import argparse
-from pathlib import Path
 import torch
-from torch.utils.data import DataLoader
 import numpy as np
-import itertools
+from torch.utils.data import DataLoader, Subset
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+# Add project root to path
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(ROOT_DIR)
 
-from utils.seed import set_global_seed
 from offline_rl.fqe_double import DoubleFQE
 from offline_rl.kuairec_dataset import KuaiRecOfflineDataset
 
 
-def resolve_device(requested):
-    if requested == "cuda" and torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+def set_global_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-def infinite_loader(loader):
-    while True:
-        for batch in loader:
-            yield batch
+def resolve_path(path):
+    """
+    Make path relative to project root.
+    """
+    if os.path.isabs(path):
+        return path
+    return os.path.join(ROOT_DIR, path)
 
 
-def run_single_seed(seed, device, steps, subsample):
+def run_single_seed(seed, device, steps, subsample, csv_path):
 
+    print(f"\nRunning seed {seed}")
     set_global_seed(seed)
 
-    csv_path = ROOT / "data" / "raw" / "kuairec" / "data" / "big_matrix.csv"
+    csv_path = resolve_path(csv_path)
 
-    dataset = KuaiRecOfflineDataset(str(csv_path), history_len=20)
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Dataset not found at: {csv_path}")
 
-    from torch.utils.data import Subset
-    import numpy as np
+    dataset = KuaiRecOfflineDataset(csv_path)
 
-    if subsample is not None and subsample < len(dataset):
-        indices = np.random.choice(len(dataset), subsample, replace=False)
-        dataset = Subset(dataset, indices)
+    print(f"[Dataset] Total transitions: {len(dataset)}")
 
-    dataloader = DataLoader(
+    # deterministic subsampling
+    rng = np.random.RandomState(seed)
+    indices = rng.choice(len(dataset), size=subsample, replace=False)
+    dataset = Subset(dataset, indices)
+
+    train_loader = DataLoader(
         dataset,
-        batch_size=512,
+        batch_size=1024,
         shuffle=True,
-        num_workers=2,
-        pin_memory=True,
-        drop_last=True,
+        num_workers=0,
+        pin_memory=False,
     )
 
-    loader = infinite_loader(dataloader)
+    eval_loader = DataLoader(
+        dataset,
+        batch_size=2048,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+    )
 
-    sample = next(loader)
+    sample = dataset[0]
     state_dim = sample["state"].shape[-1]
-    action_dim = 1
+    num_actions = dataset.dataset.num_actions
 
-    fqe = DoubleFQE(state_dim, action_dim, device=device)
+    fqe = DoubleFQE(
+        state_dim=state_dim,
+        num_actions=num_actions,
+        device=device,
+    )
+
+    loader_iter = iter(train_loader)
 
     for step in range(steps):
-        batch = next(loader)
+        try:
+            batch = next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(train_loader)
+            batch = next(loader_iter)
 
-        states = batch["state"]
-        actions = batch["action"].unsqueeze(-1).float()
-        rewards = batch["reward"].unsqueeze(-1)
-        next_states = batch["next_state"]
-        next_actions = batch["action"].unsqueeze(-1).float()
-        dones = batch["done"].unsqueeze(-1)
-
-        fqe_batch = (
-            states,
-            actions,
-            rewards,
-            next_states,
-            next_actions,
-            dones,
-        )
-
-        fqe.train_step(fqe_batch, step)
+        fqe.train_step(batch)
 
         if step % 2000 == 0:
             print(f"Step {step}")
 
-    # Fast evaluation
-    fqe.q1.eval()
-    total = 0.0
-    count = 0
+    J = fqe.evaluate(eval_loader)
+    print(f"Seed {seed} J = {J:.4f}")
 
-    with torch.no_grad():
-        for batch in itertools.islice(dataloader, 200):  # evaluate on 200 batches only
-            states = batch["state"].to(device)
-            actions = batch["action"].unsqueeze(-1).float().to(device)
-            q = fqe.q1(states, actions)
-            total += q.sum().item()
-            count += q.shape[0]
-
-    return total / count
+    return J
 
 
 def main():
-
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seeds", type=int, nargs="+", default=[0,1,2])
-    parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--steps", type=int, default=10000)
-    parser.add_argument("--subsample", type=int, default=2000000)
+    parser.add_argument(
+        "--csv_path",
+        type=str,
+        default="data/raw/kuairec/data/small_matrix.csv",
+    )
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--steps", type=int, default=20000)
+    parser.add_argument("--subsample", type=int, default=1000000)
     args = parser.parse_args()
 
-    device = resolve_device(args.device)
+    device = torch.device(args.device)
 
+    seeds = [0, 1, 2]
     results = []
 
-    for seed in args.seeds:
-        print(f"\nRunning seed {seed}")
-        J = run_single_seed(seed, device, args.steps, args.subsample)
-        print(f"Seed {seed} J = {J:.4f}")
+    for seed in seeds:
+        J = run_single_seed(
+            seed,
+            device,
+            args.steps,
+            args.subsample,
+            args.csv_path,
+        )
         results.append(J)
 
     mean = np.mean(results)
@@ -124,7 +127,7 @@ def main():
 
     print("\n==============================")
     print(f"Behavior J = {mean:.4f} ± {std:.4f}")
-    print("==============================\n")
+    print("==============================")
 
 
 if __name__ == "__main__":
