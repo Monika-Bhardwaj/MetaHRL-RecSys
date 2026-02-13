@@ -1,70 +1,88 @@
+# offline_rl/kuairec_dataset.py
+
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+import numpy as np
+
 
 class KuaiRecOfflineDataset(Dataset):
-    """
-    Highly optimized lazy offline RL dataset for KuaiRec.
-    Precomputes embeddings for faster training.
-    """
+    def __init__(self, csv_path):
 
-    def __init__(self, csv_path, history_len=20, reward_col="watch_ratio", max_rows=None):
-        self.history_len = history_len
-        self.reward_col = reward_col
-
+        print("[Dataset] Loading CSV...")
         df = pd.read_csv(csv_path)
-        if max_rows is not None:
-            df = df.iloc[:max_rows]
-
-        df = df.sort_values(["user_id", "timestamp"]).reset_index(drop=True)
-
-        # store raw columns
-        self.video_ids = torch.tensor(df["video_id"].values, dtype=torch.long)
-        self.rewards = torch.tensor(df[reward_col].values, dtype=torch.float)
-        self.user_ids = df["user_id"].values
-
-        # precompute user start and position
-        self.user_start = torch.zeros(len(df), dtype=torch.long)
-        self.pos_in_user = torch.zeros(len(df), dtype=torch.long)
-
-        last_user = None
-        start = 0
-        pos = 0
-        for i, uid in enumerate(self.user_ids):
-            if uid != last_user:
-                start = i
-                pos = 0
-                last_user = uid
-            self.user_start[i] = start
-            self.pos_in_user[i] = pos
-            pos += 1
-
-        # valid transitions
-        self.valid_indices = [i for i in range(len(df) - 1) if self.user_ids[i] == self.user_ids[i + 1]]
-
-        # max video id
-        self.max_item_id = int(self.video_ids.max().item())
 
         print(f"[Dataset] Rows: {len(df)}")
-        print(f"[Dataset] Transitions: {len(self.valid_indices)}")
+        print(f"[Dataset] Columns: {list(df.columns)}")
+
+        # ---------------------------------------------------
+        # 🔥 Detect correct action column automatically
+        # ---------------------------------------------------
+        if "item_id" in df.columns:
+            action_col = "item_id"
+        elif "video_id" in df.columns:
+            action_col = "video_id"
+        else:
+            raise ValueError("Could not find action column (item_id or video_id)")
+
+        # ---------------------------------------------------
+        # 🔥 Detect reward column automatically
+        # ---------------------------------------------------
+        if "reward" in df.columns:
+            reward_col = "reward"
+        elif "watch_ratio" in df.columns:
+            reward_col = "watch_ratio"
+        elif "watch_time" in df.columns:
+            reward_col = "watch_time"
+        else:
+            raise ValueError("Could not find reward column")
+
+        # ---------------------------------------------------
+        # Remap actions to contiguous indices
+        # ---------------------------------------------------
+        df[action_col], action_mapping = pd.factorize(df[action_col])
+        self.num_actions = len(action_mapping)
+
+        # ---------------------------------------------------
+        # State construction
+        # For big_matrix: use user_id as state feature
+        # ---------------------------------------------------
+        if "user_id" in df.columns:
+            df["user_id"], _ = pd.factorize(df["user_id"])
+            state = df[["user_id"]].values.astype(np.float32)
+        else:
+            raise ValueError("Could not find user_id column")
+
+        action = df[action_col].values.astype(np.int64)
+
+        reward = df[reward_col].values.astype(np.float32)
+
+        # Normalize reward
+        reward = (reward - reward.mean()) / (reward.std() + 1e-6)
+
+        # Next state (shifted)
+        next_state = np.roll(state, -1, axis=0)
+
+        done = np.zeros(len(df), dtype=np.float32)
+        done[-1] = 1.0
+
+        self.state = torch.tensor(state)
+        self.action = torch.tensor(action)
+        self.reward = torch.tensor(reward).unsqueeze(-1)
+        self.next_state = torch.tensor(next_state)
+        self.done = torch.tensor(done).unsqueeze(-1)
+
+        print(f"[Dataset] Transitions: {len(self.state)}")
+        print(f"[Dataset] Unique actions: {self.num_actions}")
 
     def __len__(self):
-        return len(self.valid_indices)
+        return len(self.state)
 
-    def _get_state(self, idx):
-        start = self.user_start[idx]
-        hist_start = max(start, idx - self.history_len + 1)
-        hist = self.video_ids[hist_start: idx + 1]
-        state = torch.zeros(self.history_len, dtype=torch.long)
-        state[-len(hist):] = hist
-        return state
-
-    def __getitem__(self, i):
-        idx = self.valid_indices[i]
+    def __getitem__(self, idx):
         return {
-            "state": self._get_state(idx),
-            "action": self.video_ids[idx],
-            "reward": self.rewards[idx],
-            "next_state": self._get_state(idx + 1),
-            "done": torch.tensor(0.0),
+            "state": self.state[idx],
+            "action": self.action[idx],
+            "reward": self.reward[idx],
+            "next_state": self.next_state[idx],
+            "done": self.done[idx],
         }

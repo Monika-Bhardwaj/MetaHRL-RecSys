@@ -1,16 +1,19 @@
 # offline_rl/fqe_double.py
 
-import copy
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import torch.nn.functional as F
 
 
 class QNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
+    def __init__(self, state_dim, num_actions, action_embed_dim=64, hidden_dim=256):
         super().__init__()
+
+        # 🔥 embedding for discrete item IDs
+        self.action_embedding = nn.Embedding(num_actions, action_embed_dim)
+
         self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden_dim),
+            nn.Linear(state_dim + action_embed_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -18,7 +21,10 @@ class QNetwork(nn.Module):
         )
 
     def forward(self, state, action):
-        x = torch.cat([state, action], dim=-1)
+        # action expected shape: (batch,)
+        action_emb = self.action_embedding(action.long())
+
+        x = torch.cat([state, action_emb], dim=-1)
         return self.net(x)
 
 
@@ -26,85 +32,87 @@ class DoubleFQE:
     def __init__(
         self,
         state_dim,
-        action_dim,
+        num_actions,
+        device,
         gamma=0.99,
         lr=1e-4,
-        target_update_freq=500,
-        device="cpu",
+        tau=0.005,
     ):
         self.device = device
         self.gamma = gamma
-        self.target_update_freq = target_update_freq
+        self.tau = tau
 
-        self.q1 = QNetwork(state_dim, action_dim).to(device)
-        self.q2 = QNetwork(state_dim, action_dim).to(device)
+        self.q1 = QNetwork(state_dim, num_actions).to(device)
+        self.q2 = QNetwork(state_dim, num_actions).to(device)
 
-        self.q1_target = copy.deepcopy(self.q1)
-        self.q2_target = copy.deepcopy(self.q2)
+        self.q1_target = QNetwork(state_dim, num_actions).to(device)
+        self.q2_target = QNetwork(state_dim, num_actions).to(device)
 
-        self.opt = optim.Adam(
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
+
+        self.optimizer = torch.optim.Adam(
             list(self.q1.parameters()) + list(self.q2.parameters()),
             lr=lr,
         )
 
-        self.loss_fn = nn.MSELoss()
-
-    def train_step(self, batch, step):
-
-        states, actions, rewards, next_states, next_actions, dones = batch
-
-        states = states.to(self.device)
-        actions = actions.to(self.device)
-        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
-        next_states = next_states.to(self.device)
-        next_actions = next_actions.to(self.device)
-        dones = dones.to(self.device)
+    def train_step(self, batch):
+        state = batch["state"].to(self.device)
+        action = batch["action"].to(self.device).squeeze()
+        reward = batch["reward"].to(self.device)
+        next_state = batch["next_state"].to(self.device)
+        done = batch["done"].to(self.device)
 
         with torch.no_grad():
-            q1_next = self.q1_target(next_states, next_actions)
-            q2_next = self.q2_target(next_states, next_actions)
+            next_action = action  # behavior policy
+
+            q1_next = self.q1_target(next_state, next_action)
+            q2_next = self.q2_target(next_state, next_action)
 
             q_next = torch.min(q1_next, q2_next)
-            target = rewards + self.gamma * (1 - dones) * q_next
 
+            target = reward + self.gamma * (1 - done) * q_next
 
-        q1 = self.q1(states, actions)
-        q2 = self.q2(states, actions)
+        q1 = self.q1(state, action)
+        q2 = self.q2(state, action)
 
-        loss = self.loss_fn(q1, target) + self.loss_fn(q2, target)
+        loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
 
-        self.opt.zero_grad()
+        self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(self.q1.parameters()) + list(self.q2.parameters()), 5.0
-        )
-        self.opt.step()
 
-        tau = 0.005
+        torch.nn.utils.clip_grad_norm_(self.q1.parameters(), 5.0)
+        torch.nn.utils.clip_grad_norm_(self.q2.parameters(), 5.0)
 
-        for param, target_param in zip(self.q1.parameters(), self.q1_target.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+        self.optimizer.step()
 
-        for param, target_param in zip(self.q2.parameters(), self.q2_target.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+        self._soft_update(self.q1, self.q1_target)
+        self._soft_update(self.q2, self.q2_target)
 
         return loss.item()
 
-    def evaluate(self, dataloader):
+    def _soft_update(self, net, target_net):
+        for param, target_param in zip(net.parameters(), target_net.parameters()):
+            target_param.data.copy_(
+                self.tau * param.data + (1 - self.tau) * target_param.data
+            )
 
-        self.q1.eval()
+    @torch.no_grad()
+    def evaluate(self, dataloader, max_batches=500):
+        values = []
 
-        total = 0.0
-        count = 0
+        for i, batch in enumerate(dataloader):
+            if i >= max_batches:
+                break
 
-        with torch.no_grad():
-            for batch in dataloader:
-                states, actions, _, _, _, _ = batch
-                states = states.to(self.device)
-                actions = actions.to(self.device)
+            state = batch["state"].to(self.device)
+            action = batch["action"].to(self.device).squeeze()
 
-                q = self.q1(states, actions)
-                total += q.sum().item()
-                count += q.shape[0]
+            q = torch.min(
+                self.q1(state, action),
+                self.q2(state, action),
+            )
 
-        return total / count
+            values.append(q.mean().item())
+
+        return sum(values) / len(values)
